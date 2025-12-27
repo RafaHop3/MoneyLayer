@@ -1,0 +1,19 @@
+# --- SEGURANÇA (Obrigatório) ---
+.env
+.env.local
+
+# --- LIXO DO PYTHON (Não subir) ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- AMBIENTE VIRTUAL ---
+venv/
+.venv/
+env/
+
+# --- IDEs / EDITORES ---
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MoneyLayer ERP - V15</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    
+    <style>
+        :root { --primary: #2563eb; --bg: #f3f4f6; --text: #1f2937; }
+        body { font-family: 'Inter', sans-serif; background-color: var(--bg); color: var(--text); margin: 0; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; display: none; }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .header-actions { display: flex; gap: 10px; }
+        
+        #login-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); display:flex; justify-content:center; align-items:center; z-index:999; }
+        .login-box { background:white; padding:2rem; border-radius:10px; width:300px; text-align:center; }
+        .login-box input { width:90%; padding:10px; margin:10px 0; border:1px solid #ccc; border-radius:5px; }
+        
+        .btn { background:var(--primary); color:white; border:none; padding:10px 20px; border-radius:6px; cursor:pointer; font-weight:bold; }
+        .btn-green { background: #10b981; }
+        .btn-gray { background: #4b5563; }
+        .btn-red { background: #ef4444; padding: 5px 10px; font-size: 0.8rem; }
+        
+        .kpi-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:20px; margin-bottom:20px; }
+        .card { background:white; padding:20px; border-radius:10px; box-shadow:0 2px 5px rgba(0,0,0,0.05); }
+        .valor { font-size:1.8rem; font-weight:800; margin-top:10px; }
+        
+        table { width:100%; border-collapse:collapse; margin-top:10px; font-size: 0.9rem; }
+        th, td { padding:12px; text-align:left; border-bottom:1px solid #eee; }
+        .tag-pagamento { font-size: 0.75rem; color: #555; background: #f0f0f0; padding: 2px 6px; border-radius: 4px; margin-left: 5px; }
+        .doc-tag { background:#eef2ff; color: #3730a3; padding:2px 6px; border-radius:4px; font-size:0.75rem; border:1px solid #c7d2fe; font-weight: bold; }
+
+        .modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:100; justify-content:center; align-items:center; }
+        .modal-content { background:white; padding:25px; border-radius:10px; width:600px; max-height:90vh; overflow-y:auto; }
+        .form-group { margin-bottom:15px; }
+        .form-group label { display:block; margin-bottom:5px; font-weight:600; font-size:0.8rem; color: #555; }
+        .form-group input, .form-group select, .form-group textarea { width:100%; padding:8px; border:1px solid #ddd; border-radius:5px; box-sizing:border-box;} 
+        .form-row { display:flex; gap:10px; } .form-row > div { flex:1; }
+        .section-title { border-bottom:1px solid #eee; padding-bottom:5px; margin-bottom:15px; color:var(--primary); font-weight:bold; font-size:0.9rem; margin-top:20px; }
+        
+        /* Classe para esconder coisas de funcionário */
+        .so-admin { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="login-overlay">
+        <div class="login-box">
+            <h2>🔐 Login Corporativo</h2>
+            <input type="text" id="user" placeholder="Usuário">
+            <input type="password" id="pass" placeholder="Senha">
+            <button class="btn" onclick="fazerLogin()">ENTRAR</button>
+        </div>
+    </div>
+
+    <div class="container" id="dashboard">
+        <div class="header">
+            <div>
+                <h1 style="margin:0" id="lbl-nome-empresa">ERP Financeiro</h1>
+                <small style="color:gray" id="lbl-cnpj">Carregando...</small>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-gray so-admin" onclick="abrirModal('modal-equipe')">👥 Equipe</button>
+                <button class="btn btn-gray so-admin" onclick="abrirModal('modal-perfil')">🏢 Minha Empresa</button>
+                <button class="btn btn-green" onclick="abrirModal('modal-lancamento')">+ Novo Lançamento</button>
+            </div>
+        </div>
+
+        <div class="kpi-grid">
+            <div class="card"><h3>Entradas</h3><div class="valor" style="color:#10b981" id="v-entrada">R$ 0,00</div></div>
+            <div class="card"><h3>Saídas</h3><div class="valor" style="color:#ef4444" id="v-saida">R$ 0,00</div></div>
+            <div class="card"><h3>Saldo</h3><div class="valor" style="color:#2563eb" id="v-saldo">R$ 0,00</div></div>
+        </div>
+
+        <div class="card">
+            <h3>Extrato Geral</h3>
+            <button onclick="atualizarDados()" style="float:right; margin-top:-25px; cursor:pointer;">🔄 Atualizar</button>
+            <table>
+                <thead><tr><th>Data</th><th>Descrição</th><th>Pagamento</th><th>Doc</th><th>Valor</th><th>Ação</th></tr></thead>
+                <tbody id="tabela-corpo"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="modal-lancamento" class="modal">
+        <div class="modal-content">
+            <h2 style="margin-top:0;">Lançar</h2>
+            <div class="form-row">
+                <div class="form-group"><label>Tipo</label><select id="f-tipo"><option value="despesa">Saída</option><option value="receita">Entrada</option></select></div>
+                <div class="form-group"><label>Valor</label><input type="number" id="f-valor" step="0.01"></div>
+            </div>
+            <div class="form-group"><label>Descrição</label><input type="text" id="f-descricao"></div>
+            <div class="form-row">
+                <div class="form-group"><label>Instituição</label><select id="f-banco"><option>Nubank</option><option>Inter</option><option>Itau</option><option>Caixa</option><option>Bradesco</option><option>Caixa Físico</option></select></div>
+                <div class="form-group"><label>Pagamento</label><select id="f-pagamento"><option>Pix</option><option>Boleto</option><option>Crédito</option><option>Débito</option><option>Dinheiro</option></select></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>Parcelas</label><input type="number" id="f-parcelas" value="1"></div>
+                <div class="form-group"><label>Vencimento</label><input type="date" id="f-data"></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label>Doc</label><select id="f-tipo-doc"><option>NF-e</option><option>Recibo</option><option>Sem Doc</option></select></div>
+                <div class="form-group"><label>Número</label><input type="text" id="f-num-doc"></div>
+            </div>
+            <div style="text-align:right; margin-top:20px;"><button class="btn btn-green" onclick="salvarLancamento()">Confirmar</button> <button class="btn" style="background:#ccc" onclick="fecharModal('modal-lancamento')">Cancelar</button></div>
+        </div>
+    </div>
+
+    <div id="modal-perfil" class="modal">
+        <div class="modal-content">
+            <h2>🏢 Minha Empresa</h2>
+            <div class="form-group"><label>Razão Social</label><input type="text" id="p-nome"></div>
+            <div class="form-row"><div class="form-group"><label>CNPJ</label><input type="text" id="p-cnpj"></div><div class="form-group"><label>Tel</label><input type="text" id="p-tel"></div></div>
+            <div class="form-group"><label>Endereço</label><textarea id="p-endereco" rows="2"></textarea></div>
+            <div style="text-align:right"><button class="btn btn-green" onclick="salvarPerfil()">Salvar</button> <button class="btn" style="background:#ccc" onclick="fecharModal('modal-perfil')">Cancelar</button></div>
+        </div>
+    </div>
+
+    <div id="modal-equipe" class="modal">
+        <div class="modal-content" style="width:400px;">
+            <h2>👥 Adicionar Funcionário</h2>
+            <div class="form-group"><label>Login (Nome)</label><input type="text" id="u-user"></div>
+            <div class="form-group"><label>Senha de Acesso</label><input type="password" id="u-pass"></div>
+            <div class="form-group"><label>Função</label>
+                <select id="u-funcao">
+                    <option value="funcionario">Funcionário (Lança e Visualiza)</option>
+                    <option value="admin">Administrador (Total)</option>
+                </select>
+            </div>
+            <div style="text-align:right"><button class="btn btn-green" onclick="criarUsuario()">Criar Acesso</button> <button class="btn" style="background:#ccc" onclick="fecharModal('modal-equipe')">Cancelar</button></div>
+        </div>
+    </div>
+
+    <script>
+        const BASE_URL = ""; 
+        let authHeader = null;
+        let ehAdmin = false; // Controle local
+
+        function fazerLogin() {
+            const u = document.getElementById('user').value;
+            const p = document.getElementById('pass').value;
+            authHeader = 'Basic ' + btoa(u + ":" + p);
+            
+            fetch(BASE_URL + "/saldo", { headers: { 'Authorization': authHeader } })
+                .then(res => {
+                    if (res.status === 200) {
+                        return res.json();
+                    } else throw "Erro";
+                })
+                .then(data => {
+                    document.getElementById('login-overlay').style.display = 'none';
+                    document.getElementById('dashboard').style.display = 'block';
+                    
+                    // CONTROLE DE VISUALIZAÇÃO (ADMIN vs FUNCIONÁRIO)
+                    ehAdmin = (data.usuario_funcao === 'admin');
+                    if (ehAdmin) {
+                        document.querySelectorAll('.so-admin').forEach(el => el.style.display = 'inline-block');
+                    }
+                    
+                    atualizarTela(data);
+                    carregarPerfil();
+                })
+                .catch(e => alert("Usuário ou senha inválidos!"));
+        }
+
+        function atualizarTela(dadosSaldo) {
+            document.getElementById('v-entrada').innerText = fmt(dadosSaldo.entradas);
+            document.getElementById('v-saida').innerText = fmt(dadosSaldo.saidas);
+            document.getElementById('v-saldo').innerText = fmt(dadosSaldo.saldo_final);
+            carregarExtrato();
+        }
+
+        async function carregarExtrato() {
+            const r = await fetch(`${BASE_URL}/extrato`, { headers: { 'Authorization': authHeader } });
+            const lista = await r.json();
+            const tbody = document.getElementById('tabela-corpo'); tbody.innerHTML = '';
+            
+            lista.slice(0, 30).forEach(item => {
+                const data = new Date(item.data_vencimento).toLocaleDateString('pt-BR');
+                const cor = item.tipo === 'receita' ? 'green' : 'red';
+                const btnDel = ehAdmin ? `<button class="btn-red" onclick="deletar(${item.id})">X</button>` : ''; // Só admin vê botão apagar
+                
+                tbody.innerHTML += `<tr>
+                    <td>${data}</td>
+                    <td>${item.descricao} <small style='color:gray'>${item.instituicao}</small></td>
+                    <td><span class="tag-pagamento">${item.forma_pagamento}</span></td>
+                    <td>${item.numero_documento || '-'}</td>
+                    <td style="color:${cor};font-weight:bold">${fmt(item.valor_parcela)}</td>
+                    <td>${btnDel}</td>
+                </tr>`;
+            });
+        }
+
+        async function criarUsuario() {
+            const body = {
+                username: document.getElementById('u-user').value,
+                senha: document.getElementById('u-pass').value,
+                funcao: document.getElementById('u-funcao').value
+            };
+            const res = await fetch(`${BASE_URL}/admin/usuarios`, { method: 'POST', headers: {'Authorization':authHeader, 'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            if(res.ok) { alert("Usuário criado!"); fecharModal('modal-equipe'); }
+            else alert("Erro (talvez você não seja admin ou nome já existe).");
+        }
+
+        async function deletar(id) {
+            if(!confirm("Tem certeza?")) return;
+            const res = await fetch(`${BASE_URL}/transacao/${id}`, { method: 'DELETE', headers: {'Authorization':authHeader}});
+            if(res.ok) { carregarExtrato(); } else alert("Erro ao apagar");
+        }
+
+        async function salvarLancamento() {
+             const body = {
+                descricao: document.getElementById('f-descricao').value,
+                valor: parseFloat(document.getElementById('f-valor').value),
+                tipo: document.getElementById('f-tipo').value,
+                instituicao: document.getElementById('f-banco').value,
+                forma_pagamento: document.getElementById('f-pagamento').value,
+                qtd_parcelas: parseInt(document.getElementById('f-parcelas').value),
+                data_base: document.getElementById('f-data').value || new Date().toISOString(),
+                tipo_documento: document.getElementById('f-tipo-doc').value,
+                numero_documento: document.getElementById('f-num-doc').value
+            };
+            const res = await fetch(`${BASE_URL}/lancar/`, { method: 'POST', headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+            if(res.ok) { alert("Salvo!"); fecharModal('modal-lancamento'); fazerLogin(); } // recarrega saldo
+        }
+
+        async function carregarPerfil() {
+            const res = await fetch(`${BASE_URL}/usuario/perfil`, { headers: { 'Authorization': authHeader } });
+            if(res.ok) {
+                const d = await res.json();
+                if(d.nome_empresa) {
+                    document.getElementById('lbl-nome-empresa').innerText = d.nome_empresa;
+                    document.getElementById('p-nome').value = d.nome_empresa;
+                    document.getElementById('p-cnpj').value = d.cnpj_cpf;
+                    document.getElementById('p-endereco').value = d.endereco_completo;
+                }
+            }
+        }
+        
+        async function salvarPerfil() {
+            const body = {
+                nome_empresa: document.getElementById('p-nome').value,
+                cnpj_cpf: document.getElementById('p-cnpj').value,
+                telefone: document.getElementById('p-tel').value,
+                endereco_completo: document.getElementById('p-endereco').value
+            };
+            await fetch(`${BASE_URL}/usuario/perfil`, { method: 'PUT', headers: {'Authorization':authHeader, 'Content-Type':'application/json'}, body: JSON.stringify(body)});
+            fecharModal('modal-perfil'); carregarPerfil();
+        }
+
+        function fmt(v) { return v.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }); }
+        function abrirModal(id) { document.getElementById(id).style.display = 'flex'; }
+        function fecharModal(id) { document.getElementById(id).style.display = 'none'; }
+        document.getElementById('f-data').valueAsDate = new Date();
+    </script>
+</body>
+</html>
