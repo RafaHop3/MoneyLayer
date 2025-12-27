@@ -1,86 +1,101 @@
-from fastapi import FastAPI, Query, Depends, HTTPException, status
+import os
+import secrets
+import uuid
+from datetime import datetime, timedelta
+from typing import List, Optional
+
+from fastapi import FastAPI, Query, Depends, HTTPException, status, Header
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.security import HTTPBasic, HTTPBasicCredentials, OAuth2PasswordBearer
 from pydantic import BaseModel
-from typing import List, Optional
-from datetime import datetime, date
-from dateutil.relativedelta import relativedelta 
-import secrets
-import os
-import random
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 
+# --- IMPORTAÇÕES DE SEGURANÇA E BANCO ---
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, Session, declarative_base, relationship
+from passlib.context import CryptContext # Para hash de senha
+from jose import JWTError, jwt # Para Token JWT
+from google.oauth2 import id_token # Para validar Google
+from google.auth.transport import requests as google_requests
 
 load_dotenv()
 
-app = FastAPI(title="MoneyLayer ERP V15 - Equipe")
+# --- CONFIGURAÇÕES GERAIS ---
+SECRET_KEY = os.getenv("SECRET_KEY", "sua_chave_secreta_super_segura")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7 dias de login
 
-origins = ["*"]
+# Configuração do Banco de Dados (Pega do Render/Neon)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # Fallback para teste local se esquecer a env
+    DATABASE_URL = "sqlite:///./teste_local.db" 
+
+# Corrige URL do Postgres se vier com 'postgres://' (padrão antigo do Render)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Ferramenta de Hash de Senha
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+security_basic = HTTPBasic()
+
+app = FastAPI(title="MoneyLayer SaaS V15")
+
+# CORS (Permite que o navegador aceite requisições)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DATABASE_URL = "sqlite:///./money_layer.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# ==========================================
+# 1. MODELOS DO BANCO DE DADOS (Tabelas)
+# ==========================================
 
-# ==========================================
-# 1. TABELAS (COM FUNÇÃO DE USUÁRIO)
-# ==========================================
 class UsuarioBD(Base):
-    __tablename__ = "usuarios"
+    __tablename__ = "users" # Mudei para inglês para evitar conflitos antigos
+    
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
-    senha = Column(String) # Em produção, use hash!
+    hashed_password = Column(String) # Senha Criptografada
+    role = Column(String, default="user") # 'admin' ou 'user'
     
-    # PERMISSÃO: 'admin' ou 'funcionario'
-    funcao = Column(String, default="funcionario") 
-    
-    # Dados da Empresa (Só preenchido se for Admin)
+    # Dados da Empresa (Perfil)
     nome_empresa = Column(String, nullable=True)
     cnpj_cpf = Column(String, nullable=True)
-    email_contato = Column(String, nullable=True)
     telefone = Column(String, nullable=True)
     endereco_completo = Column(String, nullable=True)
-    
-    # Em um sistema simples, todos operam na conta do Admin
-    # Mas mantemos o relacionamento para saber QUEM lançou
-    transacoes = relationship("TransacaoBD", back_populates="criador")
 
 class TransacaoBD(Base):
     __tablename__ = "transacoes"
+    
     id = Column(Integer, primary_key=True, index=True)
-    
     descricao = Column(String)
-    valor_total = Column(Float)
-    valor_parcela = Column(Float)
-    tipo = Column(String)
+    valor = Column(Float)
+    tipo = Column(String) # 'receita' ou 'despesa'
     instituicao = Column(String)
-    moeda = Column(String)
     forma_pagamento = Column(String)
-    
-    parcela_atual = Column(Integer, default=1)
-    total_parcelas = Column(Integer, default=1)
-    
+    qtd_parcelas = Column(Integer)
+    data_vencimento = Column(String) # Guardando como ISO String (YYYY-MM-DD)
     tipo_documento = Column(String)
     numero_documento = Column(String, nullable=True)
-    detalhes_fiscais = Column(String, nullable=True)
     
-    data_emissao = Column(DateTime, default=datetime.now)
-    data_vencimento = Column(DateTime, default=datetime.now)
+    # BLINDAGEM: Dono da Transação
+    dono_id = Column(Integer, ForeignKey("users.id"))
+    dono = relationship("UsuarioBD")
 
-    # Vincula a quem criou o lançamento
-    criador_id = Column(Integer, ForeignKey("usuarios.id"))
-    criador = relationship("UsuarioBD", back_populates="transacoes")
-
+# --- RECRIAR TABELAS (ATENÇÃO: ISSO RESETA O BANCO PARA APLICAR MUDANÇAS) ---
+# Se quiser limpar tudo e começar do zero, descomente a linha abaixo UMA VEZ:
+# Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 def get_db():
@@ -89,214 +104,235 @@ def get_db():
     finally: db.close()
 
 # ==========================================
-# 2. SISTEMA DE LOGIN INTELIGENTE
+# 2. SISTEMA DE SEGURANÇA (O Cérebro) 🧠
 # ==========================================
-security = HTTPBasic()
 
-def get_usuario_atual(credentials: HTTPBasicCredentials = Depends(security), db: Session = Depends(get_db)):
+def criar_token_jwt(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(
+    authorization: Optional[str] = Header(None), # Lê o Header "Authorization"
+    db: Session = Depends(get_db)
+):
     """
-    Verifica se é o Admin do .env OU um funcionário do Banco
+    Função Híbrida: Aceita tanto 'Basic Auth' (Login manual antigo)
+    quanto 'Bearer Token' (Login Google/Novo)
     """
-    env_user = os.getenv("USUARIO_MESTRE")
-    env_pass = os.getenv("SENHA_MESTRA")
-    
-    # 1. É o Admin Supremo?
-    if secrets.compare_digest(credentials.username, env_user) and secrets.compare_digest(credentials.password, env_pass):
-        # Garante que ele existe no banco
-        admin = db.query(UsuarioBD).filter(UsuarioBD.username == env_user).first()
-        if not admin:
-            admin = UsuarioBD(username=env_user, senha="***", funcao="admin")
-            db.add(admin); db.commit(); db.refresh(admin)
-        return admin
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Não autenticado")
 
-    # 2. É um Funcionário comum?
-    user = db.query(UsuarioBD).filter(UsuarioBD.username == credentials.username).first()
-    if user and secrets.compare_digest(credentials.password, user.senha):
-        return user
-    
-    raise HTTPException(status_code=401, detail="Usuário ou senha incorretos")
+    # CASO 1: Login Manual (Basic Auth)
+    if authorization.startswith("Basic "):
+        import base64
+        try:
+            encoded = authorization.split(" ")[1]
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            username, senha = decoded.split(":")
+            
+            # Verifica no Banco
+            user = db.query(UsuarioBD).filter(UsuarioBD.username == username).first()
+            if not user or not pwd_context.verify(senha, user.hashed_password):
+                raise HTTPException(status_code=401, detail="Usuário ou senha incorretos")
+            return user
+        except:
+            raise HTTPException(status_code=401, detail="Erro no login manual")
 
-def apenas_admin(usuario: UsuarioBD = Depends(get_usuario_atual)):
-    if usuario.funcao != "admin":
-        raise HTTPException(status_code=403, detail="Acesso Negado: Apenas Admin pode fazer isso.")
-    return usuario
+    # CASO 2: Login Moderno (Bearer Token / JWT)
+    elif authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            username: str = payload.get("sub")
+            if username is None: raise HTTPException(status_code=401)
+            
+            user = db.query(UsuarioBD).filter(UsuarioBD.username == username).first()
+            if user is None: raise HTTPException(status_code=401)
+            return user
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Token inválido ou expirado")
+    
+    else:
+        raise HTTPException(status_code=401, detail="Método de autenticação não suportado")
 
 # ==========================================
-# 3. MODELOS PYDANTIC
+# 3. MODELOS DE DADOS (Pydantic)
 # ==========================================
-class UsuarioCriar(BaseModel):
+class GoogleToken(BaseModel):
+    token: str
+
+class UsuarioSignup(BaseModel):
     username: str
-    senha: str
-    funcao: str = "funcionario" # admin ou funcionario
+    password: str
 
-class LancamentoCompleto(BaseModel):
+class TransacaoInput(BaseModel):
     descricao: str
     valor: float
-    tipo: str 
-    instituicao: str 
-    moeda: str = "BRL"
+    tipo: str
+    instituicao: str
     forma_pagamento: str
     qtd_parcelas: int = 1
-    tipo_documento: str 
+    data_base: str # Espera data em string (YYYY-MM-DD)
+    tipo_documento: str
     numero_documento: Optional[str] = None
-    detalhes_fiscais: Optional[str] = None
-    data_base: datetime = datetime.now()
 
-class TransacaoExibir(BaseModel):
-    id: int
-    descricao: str
-    valor_parcela: float
-    data_vencimento: datetime
-    parcela_atual: int
-    total_parcelas: int
-    tipo_documento: Optional[str]
-    numero_documento: Optional[str]
-    instituicao: str
-    forma_pagamento: Optional[str]
-    tipo: str
-    criador_id: int # Para saber quem lançou
-    class Config: from_attributes = True
-
-class PerfilUpdate(BaseModel):
-    nome_empresa: Optional[str]
-    cnpj_cpf: Optional[str]
-    email_contato: Optional[str]
-    telefone: Optional[str]
-    endereco_completo: Optional[str]
+class PerfilInput(BaseModel):
+    nome_empresa: Optional[str] = None
+    cnpj_cpf: Optional[str] = None
+    telefone: Optional[str] = None
+    endereco_completo: Optional[str] = None
 
 # ==========================================
-# 4. ROTAS
+# 4. ROTAS DO SISTEMA
 # ==========================================
 
 @app.get("/")
 def home():
     if os.path.exists("index.html"): return FileResponse("index.html")
-    return {"erro": "index.html não encontrado"}
+    return {"msg": "API MoneyLayer Online 🚀"}
 
-# --- ROTA PARA CRIAR USUÁRIOS (SÓ ADMIN) ---
-@app.post("/admin/usuarios")
-def criar_usuario_equipe(
-    novo_user: UsuarioCriar, 
-    db: Session = Depends(get_db), 
-    admin: UsuarioBD = Depends(apenas_admin) # <--- BLOQUEIO DE SEGURANÇA
-):
-    # Verifica se já existe
-    if db.query(UsuarioBD).filter(UsuarioBD.username == novo_user.username).first():
-        raise HTTPException(400, "Usuário já existe")
+# --- ROTA 1: SIGN UP (CRIAR CONTA MANUAL) ---
+@app.post("/signup")
+def cadastrar_usuario(dados: UsuarioSignup, db: Session = Depends(get_db)):
+    # Verifica duplicidade
+    if db.query(UsuarioBD).filter(UsuarioBD.username == dados.username).first():
+        raise HTTPException(400, "Usuário já existe.")
     
-    usuario = UsuarioBD(
-        username=novo_user.username,
-        senha=novo_user.senha,
-        funcao=novo_user.funcao
+    # Cria usuário com senha criptografada
+    novo = UsuarioBD(
+        username=dados.username,
+        hashed_password=pwd_context.hash(dados.password),
+        role="user"
     )
-    db.add(usuario)
-    db.commit()
-    return {"mensagem": f"Usuário {novo_user.username} criado como {novo_user.funcao}!"}
+    db.add(novo); db.commit()
+    return {"msg": "Criado com sucesso"}
 
-# --- PERFIL (LEITURA LIBERADA, EDIÇÃO SÓ ADMIN) ---
-@app.get("/usuario/perfil")
-def ver_perfil(
-    db: Session = Depends(get_db),
-    usuario: UsuarioBD = Depends(get_usuario_atual)
-):
-    # Retorna sempre o perfil do ADMIN (Empresa), não do funcionário
-    # Assume que o ID 1 é sempre o Admin ou busca pelo .env
-    env_user = os.getenv("USUARIO_MESTRE")
-    empresa = db.query(UsuarioBD).filter(UsuarioBD.username == env_user).first()
-    return empresa
+# --- ROTA 2: LOGIN COM GOOGLE ---
+@app.post("/auth/google")
+def login_google(dados: GoogleToken, db: Session = Depends(get_db)):
+    try:
+        # 1. Valida o token com o Google
+        # IMPORTANTE: Substitua pelo SEU CLIENT_ID do Google Cloud
+        CLIENT_ID = "344647037718-DK6q4Jgad9g8NTMKuWJaovRBCxvKXMYzta.apps.googleusercontent.com"
+        
+        idinfo = id_token.verify_oauth2_token(dados.token, google_requests.Request(), CLIENT_ID)
+        email = idinfo['email']
 
-@app.put("/usuario/perfil")
-def atualizar_perfil(
-    dados: PerfilUpdate, 
+        # 2. Verifica/Cria Usuário
+        user = db.query(UsuarioBD).filter(UsuarioBD.username == email).first()
+        if not user:
+            # Cria conta automática para usuário Google
+            senha_random = str(uuid.uuid4())
+            user = UsuarioBD(
+                username=email, 
+                hashed_password=pwd_context.hash(senha_random),
+                role="user"
+            )
+            db.add(user); db.commit(); db.refresh(user)
+        
+        # 3. Gera nosso Token de Acesso
+        access_token = criar_token_jwt(data={"sub": user.username})
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except ValueError:
+        raise HTTPException(401, "Token Google Inválido")
+
+# --- ROTA 3: CRIAR TRANSAÇÃO (BLINDADA) ---
+@app.post("/lancar/")
+def criar_transacao(
+    d: TransacaoInput, 
     db: Session = Depends(get_db), 
-    admin: UsuarioBD = Depends(apenas_admin) # <--- SÓ ADMIN
+    usuario: UsuarioBD = Depends(get_current_user)
 ):
-    admin.nome_empresa = dados.nome_empresa
-    admin.cnpj_cpf = dados.cnpj_cpf
-    admin.email_contato = dados.email_contato
-    admin.telefone = dados.telefone
-    admin.endereco_completo = dados.endereco_completo
-    db.commit()
-    return {"mensagem": "Perfil atualizado!"}
+    try:
+        data_base = datetime.strptime(d.data_base[0:10], "%Y-%m-%d")
+    except:
+        data_base = datetime.now()
 
-# --- ROTAS FINANCEIRAS (TODOS PODEM USAR) ---
-@app.post("/lancar/", status_code=201)
-def criar_lancamento(
-    item: LancamentoCompleto, 
-    db: Session = Depends(get_db), 
-    usuario: UsuarioBD = Depends(get_usuario_atual)
-):
-    valor_parcelado = round(item.valor / item.qtd_parcelas, 2)
-    for i in range(item.qtd_parcelas):
-        data_venc = item.data_base + relativedelta(months=i)
+    valor_parcela = d.valor / d.qtd_parcelas
+    
+    for i in range(d.qtd_parcelas):
+        prox_mes = data_base + relativedelta(months=i)
+        desc_final = d.descricao
+        if d.qtd_parcelas > 1:
+            desc_final = f"{d.descricao} ({i+1}/{d.qtd_parcelas})"
+
         nova = TransacaoBD(
-            descricao=item.descricao,
-            valor_total=item.valor,
-            valor_parcela=valor_parcelado,
-            tipo=item.tipo,
-            instituicao=item.instituicao,
-            moeda=item.moeda,
-            forma_pagamento=item.forma_pagamento,
-            parcela_atual=i+1,
-            total_parcelas=item.qtd_parcelas,
-            tipo_documento=item.tipo_documento,
-            numero_documento=item.numero_documento,
-            detalhes_fiscais=item.detalhes_fiscais,
-            data_emissao=item.data_base,
-            data_vencimento=data_venc,
-            criador_id=usuario.id # Grava quem lançou
+            descricao=desc_final,
+            valor=valor_parcela,
+            tipo=d.tipo,
+            instituicao=d.instituicao,
+            forma_pagamento=d.forma_pagamento,
+            qtd_parcelas=d.qtd_parcelas,
+            data_vencimento=prox_mes.strftime("%Y-%m-%d"),
+            tipo_documento=d.tipo_documento,
+            numero_documento=d.numero_documento,
+            dono_id=usuario.id # <--- AQUI ESTÁ A SEGURANÇA (Dono = Usuário Logado)
         )
         db.add(nova)
+    
     db.commit()
-    return {"mensagem": "Salvo!"}
+    return {"msg": "Lançamento Salvo"}
 
-def aplicar_filtros(query, instituicao, data_inicio, data_fim):
-    if instituicao: query = query.filter(TransacaoBD.instituicao == instituicao)
-    if data_inicio: query = query.filter(TransacaoBD.data_vencimento >= data_inicio)
-    if data_fim: query = query.filter(TransacaoBD.data_vencimento <= data_fim)
-    return query
+# --- ROTA 4: EXTRATO (BLINDADO) ---
+@app.get("/extrato")
+def ver_extrato(db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    # FILTRA: Só traz onde dono_id == meu id
+    lista = db.query(TransacaoBD).filter(TransacaoBD.dono_id == usuario.id).all()
+    
+    # Ordena no Python para garantir
+    lista.sort(key=lambda x: x.data_vencimento, reverse=True)
+    return lista
 
-@app.get("/extrato", response_model=List[TransacaoExibir])
-def ver_extrato(
-    instituicao: str | None = Query(None),
-    data_inicio: date | None = None,
-    data_fim: date | None = None,
-    db: Session = Depends(get_db),
-    usuario: UsuarioBD = Depends(get_usuario_atual)
-):
-    # TODOS veem tudo da empresa (Transparência interna)
-    query = db.query(TransacaoBD)
-    query = aplicar_filtros(query, instituicao, data_inicio, data_fim)
-    return query.order_by(TransacaoBD.data_vencimento.desc()).all()
-
+# --- ROTA 5: SALDO (BLINDADO) ---
 @app.get("/saldo")
-def calcular_saldo(
-    instituicao: str | None = Query(None),
-    data_inicio: date | None = None,
-    data_fim: date | None = None,
-    db: Session = Depends(get_db),
-    usuario: UsuarioBD = Depends(get_usuario_atual)
-):
-    query = db.query(TransacaoBD)
-    query = aplicar_filtros(query, instituicao, data_inicio, data_fim)
-    dados = query.all()
+def ver_saldo(db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    # FILTRA: Só soma o que é meu
+    lista = db.query(TransacaoBD).filter(TransacaoBD.dono_id == usuario.id).all()
     
-    entradas = sum(i.valor_parcela for i in dados if i.tipo == "receita")
-    saidas = sum(i.valor_parcela for i in dados if i.tipo == "despesa")
+    entradas = sum(t.valor for t in lista if t.tipo == "receita")
+    saidas = sum(t.valor for t in lista if t.tipo == "despesa")
     
-    # Retorna também a função do usuário para o Front saber o que esconder
     return {
-        "entradas": entradas, 
-        "saidas": saidas, 
+        "entradas": entradas,
+        "saidas": saidas,
         "saldo_final": entradas - saidas,
-        "usuario_funcao": usuario.funcao # <--- IMPORTANTE
+        "usuario_funcao": usuario.role
     }
 
-# --- ROTA DELETAR (SÓ ADMIN) ---
+# --- ROTA 6: PERFIL DA EMPRESA ---
+@app.get("/usuario/perfil")
+def get_perfil(db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    # Retorna o perfil do próprio usuário logado
+    return usuario
+
+@app.put("/usuario/perfil")
+def update_perfil(dados: PerfilInput, db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    usuario.nome_empresa = dados.nome_empresa
+    usuario.cnpj_cpf = dados.cnpj_cpf
+    usuario.telefone = dados.telefone
+    usuario.endereco_completo = dados.endereco_completo
+    db.commit()
+    return {"msg": "Perfil atualizado"}
+
+# --- ROTA 7: DELETAR ---
 @app.delete("/transacao/{id}")
-def deletar(id: int, db: Session = Depends(get_db), admin: UsuarioBD = Depends(apenas_admin)):
-    t = db.query(TransacaoBD).filter(TransacaoBD.id == id).first()
-    if not t: raise HTTPException(404, "Não encontrado")
+def deletar(id: int, db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    # Só deleta se o ID for igual E o DONO for o usuário logado
+    t = db.query(TransacaoBD).filter(TransacaoBD.id == id, TransacaoBD.dono_id == usuario.id).first()
+    if not t: raise HTTPException(404, "Não encontrado ou sem permissão")
     db.delete(t)
     db.commit()
     return {"msg": "Apagado"}
+
+# --- ROTA ADMIN: CRIAR USUÁRIOS MANUALMENTE ---
+@app.post("/admin/usuarios")
+def admin_criar(dados: UsuarioSignup, db: Session = Depends(get_db), usuario: UsuarioBD = Depends(get_current_user)):
+    if usuario.role != 'admin':
+        raise HTTPException(403, "Apenas Admin")
+    
+    novo = UsuarioBD(username=dados.username, hashed_password=pwd_context.hash(dados.password), role="funcionario")
+    db.add(novo); db.commit()
+    return {"msg": "Funcionário criado"}
